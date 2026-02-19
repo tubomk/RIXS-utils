@@ -886,10 +886,10 @@ def process_RIXS_data(
 
             axs["3"].imshow(hist_total[:, y_min_hist:y_max_hist].T, origin='lower', aspect='auto',
                             vmin=vmin, vmax=vmax, cmap=colormap)
-            axs["3"].axhline(y_min_hist, color='white', linestyle='-')
-            axs["3"].axhline(y_max_hist, color='white', linestyle='-')
-            axs["5"].axhline(y_min_hist, color='white', linestyle='-')
-            axs["5"].axhline(y_max_hist, color='white', linestyle='-')
+            # axs["3"].axhline(y_min_hist, color='white', linestyle='-')
+            # axs["3"].axhline(y_max_hist, color='white', linestyle='-')
+            # axs["5"].axhline(y_min_hist, color='white', linestyle='-')
+            # axs["5"].axhline(y_max_hist, color='white', linestyle='-')
             axs["4"].plot(np.arange(hist_total_2.shape[0]), np.sum(
                 hist_total_2, axis=1)/np.sum(hist_total_2), c='red')
             x_bin, y_bin, _ = binned_spectrum(np.arange(hist_total_2.shape[0]),
