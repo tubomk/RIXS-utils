@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/rixs_utils/__init__.py
+src/rixs_utils/test.py
+src/rixs_utils.egg-info/PKG-INFO
+src/rixs_utils.egg-info/SOURCES.txt
+src/rixs_utils.egg-info/dependency_links.txt
+src/rixs_utils.egg-info/top_level.txt
