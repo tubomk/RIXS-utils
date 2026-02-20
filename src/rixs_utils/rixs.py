@@ -292,6 +292,17 @@ def execute_calibration_routine(
     #### #### #### #### #### ####
 
     for data_name, dataset in named_datasets:
+        if (not runtime.has_metadata) and (
+            dataset.get("calibrationEnergies") is None
+            or len(dataset.get("calibrationEnergies", [])) == 0
+        ):
+            print(
+                f"Warning: Cannot run calibration for {data_name}. "
+                "No Spec_Files metadata found and no calibrationEnergies provided "
+                "in Analysis_parameters."
+            )
+            continue
+
         if not redo_calibration:
             if os.path.exists(f"calibration_parameters_{data_name}.npy"):
                 (m_fit, b_fit, y_max, max_sigma_x, max_sigma_y,
@@ -621,10 +632,32 @@ def process_RIXS_data(
         ScanRanges = dataset["scanNums"]
         scan_nums = _expand_scan_ranges(ScanRanges)
 
-        E_in = get_pgm_en(
-            scan_nums, spec_dir=runtime.spec_data_dir)  # type: ignore
-        mean_E_In = np.mean(get_pgm_en(
-            scan_nums, spec_dir=runtime.spec_data_dir))  # type: ignore
+        pgm_values = get_pgm_en(scan_nums, spec_dir=runtime.spec_data_dir)
+        valid_pgm_values = np.array(
+            [value for value in pgm_values if value is not None], dtype=float
+        )
+
+        if valid_pgm_values.size > 0:
+            mean_E_In = float(np.mean(valid_pgm_values))
+            E_in = np.array(
+                [value if value is not None else mean_E_In for value in pgm_values],
+                dtype=float,
+            )
+        else:
+            incident_energy = dataset.get("incidentEnergy")
+            if incident_energy is not None and np.isfinite(float(incident_energy)):
+                mean_E_In = float(incident_energy)
+            else:
+                mean_E_In = 0.0
+
+            E_in = np.full(len(scan_nums), mean_E_In, dtype=float)
+            if apply_e_in_correction:
+                print(
+                    f"No valid spec metadata found for {data_name}. "
+                    "Disabling e_IN correction for this dataset."
+                )
+                apply_e_in_correction = False
+
         # Calculate deviation in E_in and corresponding pixel shift
         if apply_e_in_correction:
             deviation = np.round((mean_E_In - E_in) /
