@@ -5,7 +5,7 @@ from .helper_functions import binned_spectrum
 from .helper_functions import sum_spectra
 from .helper_functions import make_mask, shear_and_crop_along_line, replace_lines_with_neighbor_mean
 from .helper_functions import apply_custom_plot_style, apply_custom_plot_style_light
-from .helper_functions import line, gaussian
+from .helper_functions import line, gaussian, voigt
 from .helper_functions import parse_analysis_parameters
 from numba import set_num_threads
 import os
@@ -45,15 +45,18 @@ class RuntimeContext:
     has_metadata: bool
 
 
-def _get_scan_dtype_ending(scans_folder: Path) -> str:
+def _get_scan_dtype_ending(scans_folder: Path, verbose: bool = True) -> str:
     # Infer detector scan file extension from files in the scans folder.
     scan_x_files = sorted(scans_folder.glob("*x.*"))
     if scan_x_files:
         dtype_ending = scan_x_files[0].suffix.lstrip(".").lower()
-        print(f"Detected scan extension from Scans folder: .{dtype_ending}")
+        if verbose:
+            print(
+                f"Detected scan extension from Scans folder: .{dtype_ending}")
         return dtype_ending
 
-    print("No scan files found in Scans folder. Falling back to '.bin'.")
+    if verbose:
+        print("No scan files found in Scans folder. Falling back to '.bin'.")
     return "bin"
 
 
@@ -83,6 +86,7 @@ def _build_runtime_context(
     analysis_parameters_path: Optional[PathLike] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
+    verbose: bool = True,
 ) -> RuntimeContext:
     # Validate required inputs and build shared runtime context.
     resolved_scans_dir = _resolve_optional_path(scans_path, scans_dir)
@@ -92,13 +96,15 @@ def _build_runtime_context(
         analysis_parameters_path, cwd / "Analysis_parameters.txt"
     )
 
-    print(
-        f"Using Analysis Parameters file: {resolved_analysis_parameters_path}")
-    print(f"Using Scans directory: {resolved_scans_dir}")
-    print(f"Using Spec Files directory: {resolved_spec_data_dir}")
+    if verbose:
+        print(
+            f"Using Analysis Parameters file: {resolved_analysis_parameters_path}")
+        print(f"Using Scans directory: {resolved_scans_dir}")
+        print(f"Using Spec Files directory: {resolved_spec_data_dir}")
 
     if resolved_scans_dir.exists():
-        print("Scans folder found!")
+        if verbose:
+            print("Scans folder found!")
     else:
         print(
             "Make sure all the Scans inclusive calibration Files "
@@ -108,18 +114,20 @@ def _build_runtime_context(
 
     has_metadata = resolved_spec_data_dir.exists()
     if has_metadata:
-        print("Spec Files folder found!")
+        if verbose:
+            print("Spec Files folder found!")
     else:
         print(
             "No folder with Spec Files found! Create a folder named Spec_Files (or whatever you specify) "
             "with the corresponding .spec file/s!"
         )
 
-    dtype_ending = _get_scan_dtype_ending(resolved_scans_dir)
+    dtype_ending = _get_scan_dtype_ending(resolved_scans_dir, verbose=verbose)
     file_dtype = _get_scan_file_dtype(dtype_ending)
 
     if resolved_analysis_parameters_path.exists():
-        print("Analysis parameters file found!")
+        if verbose:
+            print("Analysis parameters file found!")
     else:
         print(
             "Make sure to create the Analysis_parameters.txt file "
@@ -146,7 +154,7 @@ def _expand_scan_ranges(scan_ranges: Sequence[Tuple[int, int]]) -> List[int]:
     return [scan_num for start, end in scan_ranges for scan_num in range(start, end + 1)]
 
 
-def _build_named_datasets(data_list: Sequence[dict]) -> List[Tuple[str, dict]]:
+def _build_named_datasets(data_list: Sequence[dict], verbose: bool = True) -> List[Tuple[str, dict]]:
     # Build unique dataset names from shortDescription while preserving input order.
     total_counts: Dict[str, int] = {}
     for entry in data_list:
@@ -172,7 +180,7 @@ def _build_named_datasets(data_list: Sequence[dict]) -> List[Tuple[str, dict]]:
 
         named_datasets.append((data_name, entry))
 
-    if duplicate_mapping:
+    if duplicate_mapping and verbose:
         print("Duplicate shortDescription detected. Using unique dataset names:")
         for base_name, resolved_names in duplicate_mapping.items():
             print(f"  {base_name} -> {', '.join(resolved_names)}")
@@ -254,14 +262,17 @@ def _run_iterative_outlier_removal(
     return cleaned, changed_mask, hist_grad, total_changed_pixels, iteration
 
 
-def execute_calibration_routine(
+def calibration(
     show_plots=True,
     redo_calibration=True,
     save_parameters=True,
+    verbose=True,
     analysis_parameters_path: Optional[PathLike] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
     colormap="gnuplot", test_run=False,
+    calibration_parameters_path: Optional[PathLike] = None,
+    calibration_parameters_output_dir: Optional[PathLike] = None,
 ):
     # Run detector calibration and save calibration parameters per dataset.
 
@@ -269,13 +280,33 @@ def execute_calibration_routine(
         analysis_parameters_path=analysis_parameters_path,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
+        verbose=verbose,
     )
+
+    calibration_parameters_dir = _resolve_optional_path(
+        calibration_parameters_path, runtime.cwd
+    )
+    calibration_output_dir = _resolve_optional_path(
+        calibration_parameters_output_dir, runtime.cwd
+    )
+
+    if verbose:
+        print(
+            f"Using calibration parameters lookup directory: {calibration_parameters_dir}"
+        )
+        print(
+            f"Using calibration parameters output directory: {calibration_output_dir}")
+
+    if save_parameters:
+        calibration_output_dir.mkdir(parents=True, exist_ok=True)
 
     bad_pixels = []
     x_max, y_max = 4095, 4095
 
     data_list = parse_analysis_parameters(runtime.analysis_parameters_path)
-    named_datasets = _build_named_datasets(data_list)
+    named_datasets = _build_named_datasets(data_list, verbose=verbose)
+    total_data_sets = len(named_datasets)
+    successfully_calibrated_datasets = 0
 
     # Correct Calibration and Scan Energies
     for _, dataset in named_datasets:
@@ -304,18 +335,23 @@ def execute_calibration_routine(
             continue
 
         if not redo_calibration:
-            if os.path.exists(f"calibration_parameters_{data_name}.npy"):
+            calibration_file = calibration_parameters_dir / \
+                f"calibration_parameters_{data_name}.npy"
+            if calibration_file.exists():
                 (m_fit, b_fit, y_max, max_sigma_x, max_sigma_y,
                  mCalibration, bCalibration, var_m, var_b, cov_mb) = np.load(
-                    f"calibration_parameters_{data_name}.npy"
+                    calibration_file
                 )
-                print(f"calibration_parameters_{data_name}.npy already exists, Parameters loaded.\n"
-                      "Skip the calibration")
+                if verbose:
+                    print(f"{calibration_file.name} already exists in {calibration_parameters_dir}, Parameters loaded.\n"
+                          "Skip the calibration")
+                successfully_calibrated_datasets += 1
                 continue
             else:
                 calibration_Done = False
-                print(f"calibration_parameters_{data_name}.npy does NOT exist.\n"
-                      "Running calibration routine")
+                if verbose:
+                    print(f"{calibration_file.name} does NOT exist in {calibration_parameters_dir}.\n"
+                          "Running calibration routine")
 
         # Retrieve calibration scan files
         calibrationScanRanges = dataset["calibrationScanNums"]
@@ -424,8 +460,9 @@ def execute_calibration_routine(
         if data_name in ['Sample_31_8K', 'Sample_30_8K', 'Sample_16_8K']:
             params_l, _ = curve_fit(
                 line, peak_centers[:-2, 0], peak_centers[:-2, 1], p0=p0_l)
-            print(f"Exclude last elastic peaks for Measurement {data_name}, due to cut-off \n"
-                  "(Calibration not affected)")
+            if verbose:
+                print(f"Exclude last elastic peaks for Measurement {data_name}, due to cut-off \n"
+                      "(Calibration not affected)")
         else:
             params_l, _ = curve_fit(
                 line, peak_centers[:, 0], peak_centers[:, 1], p0=p0_l)
@@ -539,7 +576,7 @@ def execute_calibration_routine(
             plt.tight_layout()
             plt.show()
 
-        if not show_plots:
+        if not show_plots and verbose:
             print(f"Line Parameters Calibration for Data {data_name} (Energy = m*Pixel + b):"
                   f"\n m = {mCalibration:.7f} \n b = {bCalibration:.5f} \n")
 
@@ -549,16 +586,23 @@ def execute_calibration_routine(
                             stdDevs[:, 0]*mCalibration), axis=1)
         if save_parameters:
             np.save(
-                f"calibration_parameters_{data_name}.npy", calibration_parameters)
-            np.save(f"std_devs_{data_name}.npy", std_devs)
+                calibration_output_dir / f"calibration_parameters_{data_name}.npy", calibration_parameters)
+            np.save(calibration_output_dir /
+                    f"std_devs_{data_name}.npy", std_devs)
+
+        successfully_calibrated_datasets += 1
 
         if test_run:
             break
 
+    print(
+        f"Successfully completed calibration for {successfully_calibrated_datasets}/{total_data_sets} data set(s)."
+    )
+
 
 ####    ####    ####    #####
 
-def process_RIXS_data(
+def process_RIXS(
     show_plots=True,
     dark_mode=True,
     e_IN_correction=True,
@@ -568,8 +612,11 @@ def process_RIXS_data(
     verbose=True,
     analysis_parameters_path: Optional[PathLike] = None,
     scans_path: Optional[PathLike] = None,
-    spec_files_path: Optional[PathLike] = None, test_run=False,
+    spec_files_path: Optional[PathLike] = None,
+    calibration_parameters_path: Optional[PathLike] = None,
+    test_run=False,
     colormap="gnuplot",
+    bin_size_plot=8
 ):
     # Process raw RIXS detector scans into calibrated 1D/2D spectra.
 
@@ -577,13 +624,22 @@ def process_RIXS_data(
         analysis_parameters_path=analysis_parameters_path,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
+        verbose=verbose,
     )
+
+    calibration_parameters_dir = _resolve_optional_path(
+        calibration_parameters_path, runtime.cwd
+    )
+    if verbose:
+        print(
+            f"Using calibration parameters lookup directory: {calibration_parameters_dir}"
+        )
 
     bad_pixels = []
     x_max, y_max = 4095, 4095
 
     data_list = parse_analysis_parameters(runtime.analysis_parameters_path)
-    named_datasets = _build_named_datasets(data_list)
+    named_datasets = _build_named_datasets(data_list, verbose=verbose)
     total_data_sets = len(named_datasets)
 
     zoom_multiplier = 1.25
@@ -606,22 +662,26 @@ def process_RIXS_data(
     filter_size_dead_hyperactive = 7
 
     processed_data = {}
+    successfully_processed_datasets = 0
 
     for index, (data_name, dataset) in enumerate(named_datasets, start=1):
 
         processed_data[data_name] = {}
         calibration_file = True
 
-        print(
-            f"Processing data set {index}/{total_data_sets}: {data_name}")
+        if verbose:
+            print(
+                f"Processing data set {index}/{total_data_sets}: {data_name}")
         try:
+            calibration_file_path = calibration_parameters_dir / \
+                f"calibration_parameters_{data_name}.npy"
             (m_fit, b_fit, y_max_bins, _, max_sigma_y,
                 mCalibration, bCalibration, _, _, _) = np.load(
-                    f"calibration_parameters_{data_name}.npy"
+                    calibration_file_path
             )
         except FileNotFoundError:
             print(
-                f"Calibration parameters for {data_name} not found.")
+                f"Calibration parameters for {data_name} not found in {calibration_parameters_dir}.")
             calibration_file = False
             m_fit, b_fit, max_sigma_y = 1, 0, 4095
             mCalibration, bCalibration = 1, 0
@@ -712,10 +772,11 @@ def process_RIXS_data(
             verbose=verbose,
         )
         histogram_sum = cleaned.copy()
-        print(
-            f"\nTotal Changed Pixels after {iteration} iterations: {total_changed_pixels}")
-        print(
-            f"Changed Pixels: {changed_mask.sum()} ({100*changed_mask.mean():.2f}%)")
+        if verbose:
+            print(
+                f"\nTotal Changed Pixels after {iteration} iterations: {total_changed_pixels}")
+            print(
+                f"Changed Pixels: {changed_mask.sum()} ({100*changed_mask.mean():.2f}%)")
 
     #### #### DEAD LINE AND HYPERACTIVE LINE DETECTION #### ####
 
@@ -781,7 +842,7 @@ def process_RIXS_data(
             ratio > 1 + threshold_dead_hyperactiveline)[0]
         if dead_and_hyperactive_line_correction:
             hist_total = replace_lines_with_neighbor_mean(
-                hist_total, dead_lines, filter_size_dead_hyperactive, 'dead', verbose=True)
+                hist_total, dead_lines, filter_size_dead_hyperactive, 'dead', verbose=verbose)
 
         ### Shear and Crop ###
         if calibration_file:
@@ -837,14 +898,17 @@ def process_RIXS_data(
             processed_data[data_name]['x'] = energy_axis
             processed_data[data_name]['Loss_Scale'] = True
             processed_data[data_name]['y'] = np.sum(hist_total_2, axis=1)[::-1]
-            print(f"Applied E_in deviation correction. Storing as loss spectrum!")
+            if verbose:
+                print(f"Applied E_in deviation correction. Storing as loss spectrum!")
 
         elif calibration_file:
             energy_axis = np.arange(
                 hist_total_2.shape[0])*mCalibration + bCalibration
             processed_data[data_name]['x'] = energy_axis
             processed_data[data_name]['Loss_Scale'] = False
-            print(f"No E_in deviation correction applied. Storing as direct spectrum!")
+            if verbose:
+                print(
+                    f"No E_in deviation correction applied. Storing as direct spectrum!")
             processed_data[data_name]['y'] = np.sum(hist_total_2, axis=1)
 
         else:
@@ -857,7 +921,7 @@ def process_RIXS_data(
         if verbose:
             print(
                 f"Finished processing data set {index}/{total_data_sets}: {data_name}\n")
-        print("-"*80)
+            print("-"*80)
 
     ### Plotting after outlier removal and line correction ###
         if show_plots:
@@ -911,33 +975,51 @@ def process_RIXS_data(
             axs["1"].set_ylabel("Pixel")
             axs["1"].grid(color="black", alpha=1)
             axs["2"].plot(np.arange(hist_counts.shape[0]), np.sum(
-                hist_counts, axis=1)/np.sum(hist_counts), c='red')
+                hist_counts, axis=1), c='darkviolet')
+            x_bin_r, y_bin_r, _ = binned_spectrum(np.arange(hist_counts.shape[0]), np.sum(
+                hist_counts, axis=1), bin_size=bin_size_plot)
+            axs["2"].plot(x_bin_r, y_bin_r/bin_size_plot, c='black',
+                          label=f'Binned (bin size={bin_size_plot})')
             axs["2"].set_xlabel("Pixel")
             axs["2"].set_ylabel("Counts")
             axs["2"].set_xlim(0, x_max)
             axs["2"].set_yticklabels([])
+            axs["2"].legend(loc="upper right", fontsize=12)
 
             axs["3"].imshow(hist_total[:, y_min_hist:y_max_hist].T, origin='lower', aspect='auto',
                             vmin=vmin, vmax=vmax, cmap=colormap)
+
             # axs["3"].axhline(y_min_hist, color='white', linestyle='-')
             # axs["3"].axhline(y_max_hist, color='white', linestyle='-')
             # axs["5"].axhline(y_min_hist, color='white', linestyle='-')
             # axs["5"].axhline(y_max_hist, color='white', linestyle='-')
             axs["4"].plot(np.arange(hist_total_2.shape[0]), np.sum(
-                hist_total_2, axis=1)/np.sum(hist_total_2), c='red')
+                hist_total_2, axis=1)*bin_size_plot, c='darkviolet')
             x_bin, y_bin, _ = binned_spectrum(np.arange(hist_total_2.shape[0]),
-                                              np.sum(hist_total_2, axis=1), bin_size=16)
-            axs["4"].plot(x_bin, y_bin/np.sum(hist_total_2)/16, c='black')
+                                              np.sum(hist_total_2, axis=1), bin_size=bin_size_plot)
+            vmin_clean = 0.25*np.percentile(y_bin, 1)
+            vmax_clean = 1.15*np.percentile(y_bin, 99.9)
+            axs["4"].plot(x_bin, y_bin, c='black',
+                          label=f'Binned (bin size={bin_size_plot})')
+            axs["4"].set_ylim(vmin_clean, vmax_clean)
             axs["4"].set_xlabel("Pixel")
-            axs["2"].set_ylim(
-                top=3 * np.mean(np.sum(hist_counts, axis=1)/np.sum(hist_counts)))
+            axs["4"].legend(loc="upper right", fontsize=12)
+            vmin_raw = 0.25*np.percentile(np.sum(hist_counts, axis=1), 1)
+            vmax_raw = 1.15*np.percentile(np.sum(hist_counts, axis=1), 99)
+            axs["2"].set_ylim(vmin_raw, vmax_raw)
             axs["5"].imshow(changed_mask[:, y_min_hist:y_max_hist].T, origin='lower',
                             aspect='auto', cmap=colormap)
 
             plt.tight_layout()
             plt.show()
+        successfully_processed_datasets += 1
+
         if test_run:
             break
+
+    print(
+        f"Successfully processed {successfully_processed_datasets}/{total_data_sets} data set(s)."
+    )
     return processed_data
 
 
@@ -946,6 +1028,9 @@ def symmetrize_spectrum(
     show_plots=True,
     dark_mode=True,
     save_figure=True,
+    verbose=True,
+    figures_output_dir: Optional[PathLike] = None,
+    calibration_parameters_path: Optional[PathLike] = None,
     analysis_parameters_path: Optional[PathLike] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
@@ -956,6 +1041,7 @@ def symmetrize_spectrum(
         analysis_parameters_path=analysis_parameters_path,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
+        verbose=verbose,
     )
 
     if dark_mode:
@@ -963,13 +1049,32 @@ def symmetrize_spectrum(
     else:
         apply_custom_plot_style_light()
 
+    calibration_parameters_dir = _resolve_optional_path(
+        calibration_parameters_path, cwd
+    )
+    if verbose:
+        print(
+            f"Using calibration parameters lookup directory: {calibration_parameters_dir}"
+        )
+
+    figure_output_dir = _resolve_optional_path(figures_output_dir, cwd)
+    if save_figure:
+        figure_output_dir.mkdir(parents=True, exist_ok=True)
+        if verbose:
+            print(f"Using figure output directory: {figure_output_dir}")
+
+    total_data_sets = len(processed_data)
+    successfully_symmetrized_datasets = 0
+
     for k, data_name in enumerate(processed_data.keys(), start=1):
 
-        print(
-            f"Processing data set {k}/{len(processed_data)}: {data_name}")
+        if verbose:
+            print(
+                f"Processing data set {k}/{len(processed_data)}: {data_name}")
         (m_fit, b_fit, y_max_bins, max_sigma_x, max_sigma_y,
             mCalibration, bCalibration, var_m, var_b, cov_mb) = np.load(
-                f"calibration_parameters_{data_name}.npy"
+                calibration_parameters_dir /
+            f"calibration_parameters_{data_name}.npy"
         )
 
         hist_total_work = deepcopy(processed_data[data_name]['histogram'])
@@ -1055,6 +1160,7 @@ def symmetrize_spectrum(
         processed_data[data_name]['symmetrized_histogram'] = cleaned_symmetrized
         processed_data[data_name]['y_symmetrized'] = np.sum(
             cleaned_symmetrized, axis=1)[::-1]
+        successfully_symmetrized_datasets += 1
 
         if show_plots:
 
@@ -1114,20 +1220,32 @@ def symmetrize_spectrum(
             if save_figure:
                 if dark_mode:
                     plt.savefig(
-                        f"Symmetrisation_{data_name}.pdf", facecolor="#0d1117", dpi=300)
+                        figure_output_dir / f"Symmetrisation_{data_name}.pdf", facecolor="#0d1117", dpi=300)
                 else:
                     plt.savefig(
-                        f"Symmetrisation_{data_name}_light.pdf", dpi=300)
+                        figure_output_dir / f"Symmetrisation_{data_name}_light.pdf", dpi=300)
+    print(
+        f"Successfully symmetrized {successfully_symmetrized_datasets}/{total_data_sets} data set(s)."
+    )
     return processed_data
 
 
-def export_1D_spectra(processed_data, merge=True, export_txt=False):
+def export_1D_spectra(
+    processed_data,
+    merge=True,
+    export_txt=False,
+    spectra_output_dir: Optional[PathLike] = None,
+):
     # Export processed 1D spectra with optional merge for numeric suffixes (e.g., _1, _2).
 
+    output_dir = _resolve_optional_path(spectra_output_dir, cwd)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Using spectra output directory: {output_dir}")
+
     def _save_spectrum(name, array):
-        np.save(f"spectrum_{name}.npy", array)
+        np.save(output_dir / f"spectrum_{name}.npy", array)
         if export_txt:
-            np.savetxt(f"spectrum_{name}.txt", array)
+            np.savetxt(output_dir / f"spectrum_{name}.txt", array)
             print(
                 f"Spectrum saved as spectrum_{name}.npy and spectrum_{name}.txt\n"
             )

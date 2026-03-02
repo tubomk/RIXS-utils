@@ -2,7 +2,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
-
+from scipy.special import wofz
 import numpy as np
 from numba import njit, prange, set_num_threads
 
@@ -394,7 +394,7 @@ def replace_lines_with_neighbor_mean(hist, line_indices, window_size, dead_or_hy
 
     if verbose:
         print(
-            f"Identified {len(line_indices)} potential {dead_or_hyperactive} lines")
+            f"Identified {len(line_indices)} potential {dead_or_hyperactive} line(s)")
 
     dead_set = set(int(index) for index in line_indices)
     for x_pos in line_indices:
@@ -555,3 +555,20 @@ def sum_spectra(*spectra, dx=None, overlap_only=True):
 
     yerr_sum = np.sqrt(var_sum)
     return np.stack((xgrid, y_sum, yerr_sum), axis=1)
+
+
+def voigt_norm(x, x0, sigma, gamma):
+    # robuste Parameter (verhindert divide-by-zero / NaNs)
+    sigma = float(sigma)
+    gamma = float(gamma)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = 1e-9
+    if not np.isfinite(gamma) or gamma < 0.0:
+        gamma = 0.0
+    den = sigma * np.sqrt(2.0)
+    z = ((x - x0) + 1j*gamma) / den
+    return np.real(wofz(z)) / (sigma * np.sqrt(2*np.pi))
+
+
+def voigt(x, A, x0, sigma, gamma):
+    return A * voigt_norm(x, x0, sigma, gamma)
