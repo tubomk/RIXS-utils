@@ -264,6 +264,7 @@ def _run_iterative_outlier_removal(
 
 def calibration(
     show_plots=True,
+    fig_size = 9,
     redo_calibration=True,
     save_parameters=True,
     verbose=True,
@@ -509,7 +510,7 @@ def calibration(
             subtitleFontsize = 16
 
             figure_1, axes_1 = plt.subplots(
-                ncols=1, nrows=3, figsize=(9, 1.5*(9/phi)), gridspec_kw={'height_ratios': [2, 2, 2]}
+                ncols=1, nrows=3, figsize=(fig_size, 1.5*(fig_size/phi)), gridspec_kw={'height_ratios': [2, 2, 2]}
             )
 
             figure_1.suptitle(data_name,
@@ -604,6 +605,7 @@ def calibration(
 
 def process_RIXS(
     show_plots=True,
+    fig_size=9,
     dark_mode=True,
     e_IN_correction=True,
     dead_and_hyperactive_line_correction=True,
@@ -642,7 +644,7 @@ def process_RIXS(
     named_datasets = _build_named_datasets(data_list, verbose=verbose)
     total_data_sets = len(named_datasets)
 
-    zoom_multiplier = 1.25
+    zoom_multiplier = 1
     if dark_mode:
         apply_custom_plot_style()
     else:
@@ -668,6 +670,7 @@ def process_RIXS(
 
         processed_data[data_name] = {}
         calibration_file = True
+        sigma_mean = None
 
         if verbose:
             print(
@@ -679,6 +682,11 @@ def process_RIXS(
                 mCalibration, bCalibration, _, _, _) = np.load(
                     calibration_file_path
             )
+            std_devs_path = calibration_parameters_dir / \
+                f"std_devs_{data_name}.npy"
+            if std_devs_path.exists():
+                std_devs = np.load(std_devs_path)
+                sigma_mean = float(np.mean(std_devs[:, 1]))
         except FileNotFoundError:
             print(
                 f"Calibration parameters for {data_name} not found in {calibration_parameters_dir}.")
@@ -892,6 +900,8 @@ def process_RIXS(
 
         processed_data[data_name]["E_in"] = mean_E_In
         processed_data[data_name]["histogram"] = hist_total_2
+        if calibration_file and sigma_mean is not None:
+            processed_data[data_name]["resolution"] = sigma_mean
         if apply_e_in_correction and calibration_file:
             energy_axis = (
                 mean_E_In - (np.arange(hist_total_2.shape[0])*mCalibration + bCalibration))[::-1]
@@ -931,7 +941,7 @@ def process_RIXS(
                 ["2",  "4"],
             ]
             fig_spectra, axs = plt.subplot_mosaic(layout, figsize=(
-                zoom_multiplier*10, zoom_multiplier*10/phi), empty_sentinel=None)  # type:ignore
+                zoom_multiplier*fig_size, zoom_multiplier*fig_size/phi), empty_sentinel=None)  # type:ignore
             fig_spectra.suptitle(f"{data_name}", fontsize=16)
             axs: Dict[str, Axes] = axs
 
@@ -1026,6 +1036,7 @@ def process_RIXS(
 def symmetrize_spectrum(
     processed_data,
     show_plots=True,
+    fig_size=9,
     dark_mode=True,
     save_figure=True,
     verbose=True,
@@ -1168,7 +1179,7 @@ def symmetrize_spectrum(
             vmax = hist_total_work.max()/5
 
             fig_single, ax0 = plt.subplots(
-                figsize=(12, 12/phi), nrows=2, ncols=1, gridspec_kw={'height_ratios': [1, 1]})
+                figsize=(fig_size, fig_size/phi), nrows=2, ncols=1, gridspec_kw={'height_ratios': [1, 1]})
 
             # Raw spectrum
             ax0[0].imshow(hist_total_work[:, :].T, origin='lower', aspect='auto',
