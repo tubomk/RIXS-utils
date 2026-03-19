@@ -572,3 +572,306 @@ def voigt_norm(x, x0, sigma, gamma):
 
 def voigt(x, A, x0, sigma, gamma):
     return A * voigt_norm(x, x0, sigma, gamma)
+
+
+####    ####    Graze Helpers
+
+
+
+
+
+
+
+
+
+
+
+
+def parabola(y, a, b, c):
+    return a*y**2 + b*y + c
+
+
+@njit(parallel=True)
+def build_lookup(X_field, hist_shapes):
+    lookup = np.empty((hist_shapes + 1, hist_shapes + 1), dtype=np.int32)
+    for y in prange(hist_shapes + 1):
+        for x in range(hist_shapes + 1):
+            min_idx = 0
+            min_val = abs(X_field[0, y] - x)
+            for idx in range(1, X_field.shape[0]):
+                val = abs(X_field[idx, y] - x)
+                if val < min_val:
+                    min_val = val
+                    min_idx = idx
+            lookup[x, y] = min_idx
+    return lookup
+
+
+
+def apply_curve_correction(hist, lookup, x_center_grid):
+    xs, ys = np.nonzero(hist)
+    cnts = hist[xs, ys]
+    best_idxs = lookup[xs, ys]
+    x_corrs = x_center_grid[best_idxs]
+    y_corrs = ys
+    hist_corr = np.zeros_like(hist)
+    x_corrs = np.clip(x_corrs, 0, hist_corr.shape[0] - 1)
+    y_corrs = np.clip(y_corrs, 0, hist_corr.shape[1] - 1)
+    np.add.at(hist_corr, (x_corrs, y_corrs), cnts)
+    return hist_corr
+
+
+def get_motor_value(*args, motor_name="pgm_en", spec_dir=None, sort=False):
+    
+    from pathlib import Path
+
+    if spec_dir is None:
+        spec_dir = Path.cwd() / ".." / "SpecData"
+    else:
+        spec_dir = Path(spec_dir)
+
+    scan_nums = set()
+    for arg in args:
+        if isinstance(arg, np.ndarray):
+            scan_nums.update(int(x) for x in arg.ravel())
+        elif isinstance(arg, (list, tuple)):
+            if len(arg) == 0:
+                continue
+            first = arg[0]
+            if isinstance(first, (list, tuple)) and len(first) == 2:
+                # list of (start, end) range tuples
+                for start, end in arg:
+                    scan_nums.update(range(int(start), int(end) + 1))
+            elif isinstance(arg, tuple) and len(arg) == 2 and isinstance(first, (int, np.integer)):
+                # single (start, end) range tuple
+                scan_nums.update(range(int(arg[0]), int(arg[1]) + 1))
+            else:
+                scan_nums.update(int(x) for x in arg)
+        else:
+            scan_nums.add(int(arg))
+
+    if not isinstance(motor_name, str) or not motor_name.strip():
+        raise ValueError("motor_name must be a non-empty string.")
+
+    motor_name = motor_name.strip()
+    spec_files = sorted(spec_dir.glob("*.spec"))
+    valid_motor_names = set()
+
+    # Collect all motor names from SPEC headers (#O lines) to validate input.
+    for file_path in spec_files:
+        with file_path.open(encoding="utf-8") as f:
+            content = f.read()
+        header = content.split("#S ", 1)[0]
+        for line in header.split("\n"):
+            if re.match(r"#O\d+", line):
+                valid_motor_names.update(line.split()[1:])
+
+    if motor_name not in valid_motor_names:
+        valid_sorted = sorted(valid_motor_names)
+        if valid_sorted:
+            raise ValueError(
+                f"Unknown motor_name '{motor_name}'. Valid motor names are: {valid_sorted}"
+            )
+        raise ValueError(
+            f"Unknown motor_name '{motor_name}'. No motor names found in .spec headers under '{spec_dir}'."
+        )
+
+    motor_dict = {}
+    for file_path in spec_files:
+        remaining = scan_nums - set(motor_dict)
+        if not remaining:
+            break
+        with file_path.open(encoding="utf-8") as f:
+            content = f.read()
+
+        scans = content.split("#S ")
+        all_scan_nums_in_file = [
+            int(scans[k].split("\n")[0].split()[0]) for k in range(1, len(scans))
+        ]
+        needed = [n for n in remaining if n in all_scan_nums_in_file]
+        if not needed:
+            continue
+
+        # Build motor-name list from all #O lines in the file header (before first #S)
+        motor_names = []
+        for line in scans[0].split("\n"):
+            if re.match(r"#O\d+", line):
+                motor_names.extend(line.split()[1:])
+        try:
+            idx_motor = motor_names.index(motor_name)
+        except ValueError:
+            continue  # this spec file has no requested motor
+
+        for scan_num in needed:
+            scan_block = scans[all_scan_nums_in_file.index(scan_num) + 1]
+            p_values = []
+            for line in scan_block.split("\n"):
+                if re.match(r"#P\d+", line):
+                    p_values.extend(line.split()[1:])
+            if idx_motor < len(p_values):
+                raw_val = p_values[idx_motor]
+                try:
+                    motor_dict[scan_num] = float(raw_val)
+                except ValueError:
+                    motor_dict[scan_num] = raw_val
+
+    if sort:
+        motor_dict = dict(sorted(motor_dict.items(), key=lambda item: item[1]))
+    return motor_dict
+
+
+def get_pgm_en_graze(*args, spec_dir=None, sort=False):
+    """Return a dict {scan_num: pgm_en} for the given scan numbers.
+
+    This is a compatibility wrapper around get_motor_value(..., motor_name="pgm_en").
+    """
+    return get_motor_value(*args, motor_name="pgm_en", spec_dir=spec_dir, sort=sort)
+
+
+
+def read_scan_xy(path_x, path_y):
+    event_xy = np.vstack(
+        (
+            np.fromfile(path_x, dtype=np.int16),
+            np.fromfile(path_y, dtype=np.int16),
+        )
+    ).T
+    return event_xy
+
+
+def find_scan_files(scans_path, scan_nums):
+    x_files = []
+
+    for path_x in Path(scans_path).glob("*x.uint16"):
+        try:
+            scan_num = int(path_x.stem[:-1].split("_")[-1])
+        except ValueError:
+            continue
+
+        if scan_num in scan_nums:
+            path_y = Path(scans_path) / f"{path_x.stem[:-1]}y.uint16"
+            if path_y.exists():
+                x_files.append((scan_num, path_x, path_y))
+
+    return x_files
+
+
+def rotate_events_xy(x, y, theta_deg, xc=900.0, yc=900.0):
+    th = np.deg2rad(theta_deg)
+    ct, st = np.cos(th), np.sin(th)
+    dx = x - xc
+    dy = y - yc
+    xr = ct * dx - st * dy + xc
+    yr = st * dx + ct * dy + yc
+    return xr, yr
+
+
+
+def prepare_scans(calib_scan_nums, scan_ranges, spec_dir="../SpecData"):
+    calib_scan_nums = list(calib_scan_nums)
+
+    scan_energies = [np.mean(list(get_pgm_en_graze(r, spec_dir=spec_dir).values())) for r in scan_ranges]
+    all_scan_energies = [en for r in scan_ranges for en in get_pgm_en_graze(r, spec_dir=spec_dir).values()]
+    max_scan_energy = np.max(all_scan_energies)
+
+    calib_energies = [np.mean(list(get_pgm_en_graze(n, spec_dir=spec_dir).values())) for n in calib_scan_nums]
+
+    for r in scan_ranges:
+        energy = np.round(list(get_pgm_en_graze(r[0], spec_dir=spec_dir).values())[0], 2)
+        if energy not in np.round(calib_energies, 2):
+            calib_scan_nums.append(r[0])
+            print(f"Added scan {r[0]} with energy {energy} eV to calibration scans.")
+
+    calibration_energies = [list(get_pgm_en_graze(n, spec_dir=spec_dir).values())[0] for n in calib_scan_nums]
+
+    calib_scan_nums = [n for _, n in sorted(zip(np.round(calibration_energies, 2), calib_scan_nums))]
+    calibration_energies = [list(get_pgm_en_graze(n, spec_dir=spec_dir).values())[0] for n in calib_scan_nums]
+
+    filtered = [
+        (energy, n)
+        for energy, n in zip(calibration_energies, calib_scan_nums)
+        if round(energy, 2) <= round(max_scan_energy, 2)
+    ]
+
+    calibration_energies, calib_scan_nums = zip(*filtered) if filtered else ([], [])
+    calibration_energies = list(calibration_energies)
+    calib_scan_nums = list(calib_scan_nums)
+
+    return calib_scan_nums, calibration_energies, scan_energies
+
+
+def _rot_to_local(xg, yg, phi, xc, yc):
+    cp, sp = np.cos(phi), np.sin(phi)
+    dx, dy = xg - xc, yg - yc
+    u = cp * dx + sp * dy
+    v = -sp * dx + cp * dy
+    return u, v
+
+
+def _solve_y_branches(x_vals, a, b, c, phi, xc, yc):
+    cp, sp = np.cos(phi), np.sin(phi)
+
+    Aq = -sp * a
+    Bq = cp - sp * b
+    Cq = xc - sp * c - x_vals
+
+    y1 = np.full_like(x_vals, np.nan, dtype=float)
+    y2 = np.full_like(x_vals, np.nan, dtype=float)
+    eps = 1e-12
+
+    if abs(Aq) < eps:
+        if abs(Bq) > eps:
+            u = -Cq / Bq
+            v = a * u**2 + b * u + c
+            y1 = yc + sp * u + cp * v
+        return y1, y2
+
+    D = Bq**2 - 4.0 * Aq * Cq
+    ok = D >= 0
+    root = np.zeros_like(D)
+    root[ok] = np.sqrt(D[ok])
+
+    u1 = np.full_like(x_vals, np.nan, dtype=float)
+    u2 = np.full_like(x_vals, np.nan, dtype=float)
+
+    u1[ok] = (-Bq + root[ok]) / (2.0 * Aq)
+    u2[ok] = (-Bq - root[ok]) / (2.0 * Aq)
+
+    v1 = a * u1**2 + b * u1 + c
+    v2 = a * u2**2 + b * u2 + c
+
+    y1 = yc + sp * u1 + cp * v1
+    y2 = yc + sp * u2 + cp * v2
+    return y1, y2
+
+
+def _lower_upper_branch(y1, y2):
+    m1 = np.nanmean(y1) if np.any(np.isfinite(y1)) else np.inf
+    m2 = np.nanmean(y2) if np.any(np.isfinite(y2)) else np.inf
+
+    if m1 <= m2:
+        return y1, y2
+    return y2, y1
+
+
+def intersection_with_mask(x_bottom, bottom_jump, x_top, top_jump, mask_region):
+    n = int(max(abs(x_top - x_bottom), abs(top_jump - bottom_jump))) + 1
+    t = np.linspace(0.0, 1.0, n)
+
+    x_line = x_bottom + t * (x_top - x_bottom)
+    y_line = bottom_jump + t * (top_jump - bottom_jump)
+
+    xi = np.clip(np.rint(x_line).astype(int), 0, mask_region.shape[0] - 1)
+    yi = np.clip(np.rint(y_line).astype(int), 0, mask_region.shape[1] - 1)
+
+    inside = mask_region[xi, yi]
+    idx = np.where(inside)[0]
+
+    if idx.size == 0:
+        return None
+
+    i0, i1 = idx[0], idx[-1]
+    p_low = (int(xi[i0]), int(yi[i0]))
+    p_high = (int(xi[i1]), int(yi[i1]))
+
+    return p_low, p_high
