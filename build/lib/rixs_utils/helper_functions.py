@@ -2,6 +2,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import Mapping
 from scipy.special import wofz
 import numpy as np
 from numba import njit, prange, set_num_threads
@@ -10,7 +11,65 @@ num_cpus = os.cpu_count() or 1
 set_num_threads(max(1, num_cpus - 2))  # type: ignore
 
 
-def parse_analysis_parameters(filepath):
+def _normalize_scan_group_value(value, key, idx):
+    if isinstance(value, tuple) and all(isinstance(x, int) for x in value):
+        if len(value) != 2:
+            raise ValueError(
+                f"Tuple for '{key}' in measurement {idx} must contain exactly 2 integers."
+            )
+        return [value]
+
+    if isinstance(value, list):
+        for element in value:
+            is_range_tuple = (
+                isinstance(element, tuple)
+                and len(element) == 2
+                and all(isinstance(x, int) for x in element)
+            )
+            is_explicit_scan_list = (
+                isinstance(element, list)
+                and len(element) > 0
+                and all(isinstance(x, int) for x in element)
+            )
+            if not (is_range_tuple or is_explicit_scan_list):
+                raise ValueError(
+                    f"Each entry in '{key}' of measurement {idx} must be either "
+                    "a tuple of two integers or a list of integers."
+                )
+        return value
+
+    raise ValueError(
+        f"Invalid format for '{key}' in measurement {idx}. Must be a tuple, "
+        "a list of 2-tuples, or a list of integer lists."
+    )
+
+
+def _finalize_analysis_parameters(data_raw):
+    data = []
+    required_keys = ["calibrationScanNums", "scanNums"]
+    scan_group_keys = ["scanNums", "calibrationScanNums"]
+
+    for idx in sorted(data_raw.keys()):
+        entry = dict(data_raw[idx])
+
+        for key in required_keys:
+            if key not in entry:
+                raise ValueError(
+                    f"Missing required field '{key}' in measurement {idx}.")
+
+        for key in scan_group_keys:
+            entry[key] = _normalize_scan_group_value(entry.get(key), key, idx)
+
+        entry.setdefault("calibrationEnergies", None)
+        entry.setdefault("incidentEnergy", None)
+        entry.setdefault("description", f"Data_{idx}: No description provided")
+        entry.setdefault("shortDescription", f"Data_{idx}")
+        data.append(entry)
+
+    return data
+
+
+def _parse_analysis_parameters_file(filepath):
     data_raw = defaultdict(dict)
     number_measurements = None
     single_entry_keys = {}
@@ -57,49 +116,46 @@ def parse_analysis_parameters(filepath):
         else:
             number_measurements = len(data_raw)
 
-    data = []
-    required_keys = ["calibrationScanNums", "scanNums"]
-    ensure_list_of_tuples = ["scanNums", "calibrationScanNums"]
+    return _finalize_analysis_parameters(data_raw)
 
-    for idx in sorted(data_raw.keys()):
-        entry = data_raw[idx]
 
-        for key in required_keys:
-            if key not in entry:
-                raise ValueError(
-                    f"Missing required field '{key}' in measurement {idx}.")
+def _parse_analysis_parameters_dict(parameter_dict):
+    if not isinstance(parameter_dict, Mapping) or len(parameter_dict) == 0:
+        raise ValueError(
+            "analysis_parameters_dict must be a non-empty dictionary keyed by measurement number."
+        )
 
-        for key in ensure_list_of_tuples:
-            value = entry.get(key)
-            if isinstance(value, tuple) and all(isinstance(x, int) for x in value):
-                if len(value) != 2:
-                    raise ValueError(
-                        f"Tuple for '{key}' in measurement {idx} must contain exactly 2 integers."
-                    )
-                value = [value]
-            elif isinstance(value, list):
-                for element in value:
-                    if not (
-                        isinstance(element, tuple)
-                        and len(element) == 2
-                        and all(isinstance(x, int) for x in element)
-                    ):
-                        raise ValueError(
-                            f"Each entry in '{key}' of measurement {idx} must be a tuple of two integers."
-                        )
-            else:
-                raise ValueError(
-                    f"Invalid format for '{key}' in measurement {idx}. Must be a tuple or list of 2-tuples."
-                )
-            entry[key] = value
+    data_raw = {}
+    for raw_idx, entry in parameter_dict.items():
+        if isinstance(raw_idx, int):
+            idx = raw_idx
+        elif isinstance(raw_idx, str) and raw_idx.isdigit():
+            idx = int(raw_idx)
+        else:
+            raise ValueError(
+                "analysis_parameters_dict keys must be integers such as 1, 2, 3."
+            )
 
-        entry.setdefault("calibrationEnergies", None)
-        entry.setdefault("incidentEnergy", None)
-        entry.setdefault("description", f"Data_{idx}: No description provided")
-        entry.setdefault("shortDescription", f"Data_{idx}")
-        data.append(entry)
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                f"Measurement {raw_idx} in analysis_parameters_dict must be a dictionary."
+            )
 
-    return data
+        data_raw[idx] = dict(entry)
+
+    return _finalize_analysis_parameters(data_raw)
+
+
+def parse_analysis_parameters(source):
+    if isinstance(source, (str, os.PathLike, Path)):
+        return _parse_analysis_parameters_file(source)
+
+    if isinstance(source, Mapping):
+        return _parse_analysis_parameters_dict(source)
+
+    raise ValueError(
+        "analysis parameters must be provided either as a filepath or as a dictionary."
+    )
 
 
 def gaussian(x, amp, mu, sigma, offset):
@@ -387,6 +443,38 @@ def median_filter_numpy(arr, size):
     return out
 
 
+@njit(parallel=True)
+def median_and_mad_filter_numpy(arr, size):
+    if size % 2 == 0:
+        raise ValueError("size must be odd")
+    pad = size // 2
+    h, w = arr.shape
+    n_neighbors = size * size - 1
+    median_out = np.empty_like(arr)
+    mad_out = np.empty_like(arr)
+
+    for i in prange(h):
+        win = np.empty(n_neighbors, dtype=arr.dtype)
+        dev = np.empty(n_neighbors, dtype=arr.dtype)
+        for j in range(w):
+            idx = 0
+            for di in range(-pad, pad + 1):
+                ii = reflect_index(i + di, h)
+                for dj in range(-pad, pad + 1):
+                    jj = reflect_index(j + dj, w)
+                    if ii == i and jj == j:
+                        continue
+                    win[idx] = arr[ii, jj]
+                    idx += 1
+            sorted_win = np.sort(win)
+            med = sorted_win[n_neighbors // 2]
+            median_out[i, j] = med
+            for k in range(n_neighbors):
+                dev[k] = abs(sorted_win[k] - med)
+            sorted_dev = np.sort(dev)
+            mad_out[i, j] = sorted_dev[n_neighbors // 2]
+    return median_out, mad_out
+
 def replace_lines_with_neighbor_mean(hist, line_indices, window_size, dead_or_hyperactive, verbose=False):
     half_size = window_size // 2
     if line_indices.size == 0:
@@ -413,22 +501,52 @@ def replace_lines_with_neighbor_mean(hist, line_indices, window_size, dead_or_hy
 def print_analysis_parameters_template():
     print(
         "numberMeasurements = N\n\n"
-        "calibrationScanNums_1 = [(start1, end1), (start2, end2)]\n"
+        "calibrationScanNums_1 = [(start1, end1), [scanA, scanB, scanC]]\n"
         "calibrationEnergies_1 = [E1, E2, E3, ...]\n"
         "scanNums_1 = [(start, end)]\n"
         "incidentEnergy_1 = Ein\n"
         "description_1 = \"...\"\n"
         "shortDescription_1 = \"...\"\n\n"
-        "calibrationScanNums_2 = [(start1, end1), (start2, end2)]\n"
+        "calibrationScanNums_2 = [(start1, end1), [scanA, scanB, scanC]]\n"
         "calibrationEnergies_2 = [E1, E2, E3, ...]\n"
         "scanNums_2 = [(start, end)]\n"
         "incidentEnergy_2 = Ein\n"
         "description_2 = \"...\"\n"
         "shortDescription_2 = \"...\"\n"
         "\n\n\n"
-        "NOTE: Actual calibration energies and incoming energies are optional.\n"
-        "They are inferred from metadata if available. Place the corresponding .spec "
-        "file in Spec_Files (or provide the directory explicitly)."
+        "NOTE: 'calibrationScanNums' and 'scanNums' can be either a list of tuples [(start, end)]\n"
+        "or a list of lists with specific scan numbers.\n\n"
+        "Actual calibration energies and incoming energies ('calibrationEnergies', 'incidentEnergy') are optional.\n"
+        "They are inferred from metadata if available. Place the corresponding .spec \n"
+        "file in Spec_Files (or provide the directory explicitly).\n\n"
+        "'description' is optional but 'shortDescription' is mandatory for documentation and labeling purposes.\n"
+    )
+
+
+def print_analysis_parameters_dict_template():
+    print(
+        "dict_inputs = {\n"
+        "    1: {\n"
+        "        \"calibrationScanNums\": [(1000, 1005)],\n"
+        "        \"calibrationEnergies\": [100, 101, 102, 103, 104, 105],\n"
+        "        \"scanNums\": [(1010, 1020)],\n"
+        "        \"incidentEnergy\": 101.5,\n"
+        "        \"description\": \"Descriptive text here...\",\n"
+        "        \"shortDescription\": \"Sample_1\"\n"
+        "    },\n"
+        "    2: {\n"
+        "        \"calibrationScanNums\": [[1030, 1031, 1032, 1034]],\n"
+        "        \"scanNums\": [[1035, 1036, 1040, 1041]],\n"
+        "        \"shortDescription\": \"Sample_2\"\n"
+        "    }\n"
+        "}\n\n"
+        "NOTE: 'calibrationScanNums' and 'scanNums' can be either a list of tuples [(start, end)]\n"
+        "or a list of lists with specific scan numbers.\n\n"
+        "Actual calibration energies and incoming energies ('calibrationEnergies', 'incidentEnergy') are optional.\n"
+        "They are inferred from metadata if available. Place the corresponding .spec \n"
+        "file in Spec_Files (or provide the directory explicitly).\n\n"
+        "'description' is optional but 'shortDescription' is mandatory for documentation and labeling purposes.\n"
+        
     )
 
 
@@ -767,7 +885,7 @@ def rotate_events_xy(x, y, theta_deg, xc=900.0, yc=900.0):
 
 
 
-def prepare_scans(calib_scan_nums, scan_ranges, spec_dir="../SpecData"):
+def prepare_scans(calib_scan_nums, scan_ranges, spec_dir="../SpecData", use_scan_energies=True):
     calib_scan_nums = list(calib_scan_nums)
 
     scan_energies = [np.mean(list(get_pgm_en_graze(r, spec_dir=spec_dir).values())) for r in scan_ranges]
@@ -776,11 +894,12 @@ def prepare_scans(calib_scan_nums, scan_ranges, spec_dir="../SpecData"):
 
     calib_energies = [np.mean(list(get_pgm_en_graze(n, spec_dir=spec_dir).values())) for n in calib_scan_nums]
 
-    for r in scan_ranges:
-        energy = np.round(list(get_pgm_en_graze(r[0], spec_dir=spec_dir).values())[0], 2)
-        if energy not in np.round(calib_energies, 2):
-            calib_scan_nums.append(r[0])
-            print(f"Added scan {r[0]} with energy {energy} eV to calibration scans.")
+    if use_scan_energies:
+        for r in scan_ranges:
+            energy = np.round(list(get_pgm_en_graze(r[0], spec_dir=spec_dir).values())[0], 2)
+            if energy not in np.round(calib_energies, 2):
+                calib_scan_nums.append(r[0])
+                print(f"Added scan {r[0]} with energy {energy} eV to calibration scans.")
 
     calibration_energies = [list(get_pgm_en_graze(n, spec_dir=spec_dir).values())[0] for n in calib_scan_nums]
 

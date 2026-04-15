@@ -1,5 +1,6 @@
 from .helper_functions import print_analysis_parameters_template
-from .helper_functions import median_filter_numpy
+from .helper_functions import print_analysis_parameters_dict_template
+from .helper_functions import median_filter_numpy, median_and_mad_filter_numpy
 from .helper_functions import get_pgm_en
 from .helper_functions import binned_spectrum
 from .helper_functions import sum_spectra
@@ -10,17 +11,21 @@ from .helper_functions import parse_analysis_parameters
 from numba import set_num_threads
 import os
 import sys
+import copy
 from copy import deepcopy
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
-from scipy.ndimage import median_filter
+from matplotlib.colors import LogNorm
+from scipy.optimize import curve_fit, minimize_scalar
+from scipy.ndimage import median_filter, gaussian_filter, distance_transform_edt, gaussian_filter1d
+from scipy.interpolate import interp1d
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from matplotlib.axes import Axes
 import math
 from dataclasses import dataclass
 phi = (1 + math.sqrt(5)) / 2
+
 
 num_cpus = os.cpu_count()
 set_num_threads(num_cpus - 2)  # type: ignore
@@ -39,7 +44,8 @@ class RuntimeContext:
     cwd: Path
     scans_dir: Path
     spec_data_dir: Path
-    analysis_parameters_path: Path
+    analysis_parameters_path: Optional[Path]
+    analysis_parameters: List[dict]
     dtype_ending: str
     file_dtype: Any
     has_metadata: bool
@@ -84,21 +90,28 @@ def _resolve_optional_path(path_value: Optional[PathLike], default_path: Path) -
 
 def _build_runtime_context(
     analysis_parameters_path: Optional[PathLike] = None,
+    analysis_parameters_dict: Optional[Dict[int, Dict[str, Any]]] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
     verbose: bool = True,
+    require_analysis_parameters: bool = True,
 ) -> RuntimeContext:
     # Validate required inputs and build shared runtime context.
     resolved_scans_dir = _resolve_optional_path(scans_path, scans_dir)
     resolved_spec_data_dir = _resolve_optional_path(
         spec_files_path, spec_data_dir)
-    resolved_analysis_parameters_path = _resolve_optional_path(
-        analysis_parameters_path, cwd / "Analysis_parameters.txt"
-    )
+    resolved_analysis_parameters_path = None
+    if analysis_parameters_path is not None or require_analysis_parameters:
+        resolved_analysis_parameters_path = _resolve_optional_path(
+            analysis_parameters_path, cwd / "Analysis_parameters.txt"
+        )
 
     if verbose:
-        print(
-            f"Using Analysis Parameters file: {resolved_analysis_parameters_path}")
+        if analysis_parameters_dict is not None:
+            print("Using analysis parameters from provided dictionary.")
+        elif resolved_analysis_parameters_path is not None:
+            print(
+                f"Using Analysis Parameters file: {resolved_analysis_parameters_path}")
         print(f"Using Scans directory: {resolved_scans_dir}")
         print(f"Using Spec Files directory: {resolved_spec_data_dir}")
 
@@ -125,33 +138,70 @@ def _build_runtime_context(
     dtype_ending = _get_scan_dtype_ending(resolved_scans_dir, verbose=verbose)
     file_dtype = _get_scan_file_dtype(dtype_ending)
 
-    if resolved_analysis_parameters_path.exists():
-        if verbose:
-            print("Analysis parameters file found!")
-    else:
-        print(
-            "Make sure to create the Analysis_parameters.txt file "
-            "using the 'Write Analysis Parameter File.exe' executable,"
-            " or use the template structure printed below to create it manually!"
-        )
-        print("\nExample structure for Analysis_parameters.txt:\n")
-        print_analysis_parameters_template()
-        sys.exit()
+    analysis_parameters: List[dict] = []
+    if analysis_parameters_dict is not None:
+        try:
+            analysis_parameters = parse_analysis_parameters(
+                analysis_parameters_dict)
+        except ValueError as exc:
+            print(f"Invalid analysis_parameters_dict: {exc}")
+            print("\nExample structure for analysis_parameters_dict:\n")
+            print_analysis_parameters_dict_template()
+            sys.exit()
+    elif require_analysis_parameters:
+        assert resolved_analysis_parameters_path is not None
+        if resolved_analysis_parameters_path.exists():
+            if verbose:
+                print("Analysis parameters file found!")
+            try:
+                analysis_parameters = parse_analysis_parameters(
+                    resolved_analysis_parameters_path)
+            except ValueError as exc:
+                print(f"Invalid Analysis_parameters input: {exc}")
+                print("\nExample structure for Analysis_parameters.txt:\n")
+                print_analysis_parameters_template()
+                print("\nExample structure for analysis_parameters_dict:\n")
+                print_analysis_parameters_dict_template()
+                sys.exit()
+        else:
+            print(
+                "Provide either a valid Analysis_parameters.txt file or "
+                "analysis_parameters_dict."
+            )
+            print("\nExample structure for Analysis_parameters.txt:\n")
+            print_analysis_parameters_template()
+            print("\nExample structure for analysis_parameters_dict:\n")
+            print_analysis_parameters_dict_template()
+            sys.exit()
 
     return RuntimeContext(
         cwd=cwd,
         scans_dir=resolved_scans_dir,
         spec_data_dir=resolved_spec_data_dir,
         analysis_parameters_path=resolved_analysis_parameters_path,
+        analysis_parameters=analysis_parameters,
         dtype_ending=dtype_ending,
         file_dtype=file_dtype,
         has_metadata=has_metadata,
     )
 
 
-def _expand_scan_ranges(scan_ranges: Sequence[Tuple[int, int]]) -> List[int]:
-    # Expand scan ranges into an explicit list of scan numbers.
-    return [scan_num for start, end in scan_ranges for scan_num in range(start, end + 1)]
+def _expand_scan_ranges(
+    scan_ranges: Sequence[Union[Tuple[int, int], Sequence[int]]]
+) -> List[int]:
+    # Expand scan groups into an explicit list of scan numbers.
+    expanded_scan_nums: List[int] = []
+    for scan_group in scan_ranges:
+        if (
+            isinstance(scan_group, tuple)
+            and len(scan_group) == 2
+            and all(isinstance(x, (int, np.integer)) for x in scan_group)
+        ):
+            start, end = (int(scan_group[0]), int(scan_group[1]))
+            expanded_scan_nums.extend(range(start, end + 1))
+        else:
+            expanded_scan_nums.extend(int(scan_num) for scan_num in scan_group)
+    return expanded_scan_nums
 
 
 def _build_named_datasets(data_list: Sequence[dict], verbose: bool = True) -> List[Tuple[str, dict]]:
@@ -202,6 +252,7 @@ def _collect_scan_pairs(
 
 
 def _run_iterative_outlier_removal(
+    elastic_on_detector: bool,
     histogram: np.ndarray,
     threshold_range: np.ndarray,
     window_mad_filter: int,
@@ -209,6 +260,9 @@ def _run_iterative_outlier_removal(
     verbose: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     # Iteratively suppress outlier pixels based on local median statistics.
+    # When elastic_on_detector is True, uses MAD-based noise estimation
+    # that adapts to local signal structure (preserves real intensity gradients)
+    # and pre-fills dead pixels to prevent median contamination.
     total_steps = len(threshold_range)
     total_changed_pixels = 0
 
@@ -218,18 +272,38 @@ def _run_iterative_outlier_removal(
     hist_grad = histogram_sum.copy()
     cleaned = histogram_sum.copy()
 
+    # Identify dead pixels (0 counts in summed histogram) and pre-fill them
+    # with the local median so they don't drag down neighbor statistics.
+    dead_pixel_mask = histogram == 0
+    if elastic_on_detector and dead_pixel_mask.any():
+        prefill_median = median_filter_numpy(histogram_sum, size=window_mad_filter)
+        histogram_sum = np.where(dead_pixel_mask, prefill_median, histogram_sum)
+        cleaned = histogram_sum.copy()
+
     if verbose:
         print(
             "Starting iterative outlier removal with thresholds: "
             f"{threshold_range[0]} down to {threshold_range[-1]}"
         )
+        if elastic_on_detector:
+            print("Using MAD-based adaptive noise estimation (elastic on detector)")
 
     for step, threshold in enumerate(threshold_range, start=1):
         while True:
-            median_img = median_filter_numpy(
-                histogram_sum, size=window_mad_filter)
-            mask_keep = histogram_sum - \
-                median_img <= threshold * np.sqrt(median_img)
+            if elastic_on_detector:
+                median_img, mad_img = median_and_mad_filter_numpy(
+                    histogram_sum, size=window_mad_filter)
+                # MAD-to-sigma conversion (1.4826) with Poisson floor
+                noise_estimate = np.maximum(
+                    1.4826 * mad_img,
+                    np.sqrt(np.maximum(median_img, 1.0))
+                )
+            else:
+                median_img = median_filter_numpy(
+                    histogram_sum, size=window_mad_filter)
+                noise_estimate = np.sqrt(median_img)
+
+            mask_keep = histogram_sum - median_img <= threshold * noise_estimate
             cleaned = np.where(mask_keep, histogram_sum, median_img)
 
             changed_mask += ~mask_keep
@@ -252,6 +326,10 @@ def _run_iterative_outlier_removal(
             )
 
     cleaned = np.asarray(cleaned) - 1
+    # Restore dead pixels to 0
+    if elastic_on_detector and dead_pixel_mask.any():
+        cleaned[dead_pixel_mask] = 0
+
     if verbose:
         print(
             f"\nTotal Changed Pixels after {iteration} iterations: {total_changed_pixels}"
@@ -262,23 +340,29 @@ def _run_iterative_outlier_removal(
     return cleaned, changed_mask, hist_grad, total_changed_pixels, iteration
 
 
+
 def calibration(
     show_plots=True,
     fig_size = 9,
+    dark_mode=True,
     redo_calibration=True,
     save_parameters=True,
     verbose=True,
     analysis_parameters_path: Optional[PathLike] = None,
+    analysis_parameters_dict: Optional[Dict[int, Dict[str, Any]]] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
     colormap="gnuplot", test_run=False,
     calibration_parameters_path: Optional[PathLike] = None,
     calibration_parameters_output_dir: Optional[PathLike] = None,
+    percentile_threshold=99.9,
+    
 ):
     # Run detector calibration and save calibration parameters per dataset.
 
     runtime = _build_runtime_context(
         analysis_parameters_path=analysis_parameters_path,
+        analysis_parameters_dict=analysis_parameters_dict,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
         verbose=verbose,
@@ -304,17 +388,20 @@ def calibration(
     bad_pixels = []
     x_max, y_max = 4095, 4095
 
-    data_list = parse_analysis_parameters(runtime.analysis_parameters_path)
+    x_ticks_size = plt.rcParams["xtick.labelsize"]
+    y_ticks_size = plt.rcParams["ytick.labelsize"]
+    axes_label_size = plt.rcParams["axes.labelsize"]
+
+    data_list = runtime.analysis_parameters
     named_datasets = _build_named_datasets(data_list, verbose=verbose)
     total_data_sets = len(named_datasets)
     successfully_calibrated_datasets = 0
 
+
     # Correct Calibration and Scan Energies
     for _, dataset in named_datasets:
-        calib_scan_nums = np.arange(
-            dataset['calibrationScanNums'][0][0], dataset['calibrationScanNums'][0][1] + 1)
-        scan_nums = np.arange(dataset['scanNums']
-                              [0][0], dataset['scanNums'][0][1] + 1)
+        calib_scan_nums = _expand_scan_ranges(dataset["calibrationScanNums"])
+        scan_nums = _expand_scan_ranges(dataset["scanNums"])
         if runtime.has_metadata:
             dataset['calibrationEnergies'] = get_pgm_en(
                 calib_scan_nums, spec_dir=runtime.spec_data_dir)
@@ -505,6 +592,14 @@ def calibration(
         # var_m, var_b, cov_mb = pcoval_l[0,0], pcoval_l[1,1], pcoval_l[0,1]
 
         if show_plots == True:
+
+            if dark_mode:
+                apply_custom_plot_style()
+                preferred_color = "white"
+            else:
+                apply_custom_plot_style_light()
+                preferred_color = "black"
+
             letters = list("abcdefghijklmnopqrstuvwxyz")
             titleFontsize = 18
             subtitleFontsize = 16
@@ -513,8 +608,10 @@ def calibration(
                 ncols=1, nrows=3, figsize=(fig_size, 1.5*(fig_size/phi)), gridspec_kw={'height_ratios': [2, 2, 2]}
             )
 
+            scale = figure_1.get_figwidth() / (6*2)
+            
             figure_1.suptitle(data_name,
-                              fontsize=titleFontsize)
+                              fontsize=titleFontsize*scale)
             mask = make_mask(histSum.T.shape, (m_fit, b_fit), max_sigma_y, 5.8)
             histSum = histSum * mask.T
             y_indices_with_true = np.where(mask.any(axis=1))[0]
@@ -525,13 +622,14 @@ def calibration(
             mean_bottomk = np.mean(np.partition(
                 histSum.ravel(), k_ - 1)[:k_])
             mean_topk = np.mean(np.partition(histSum.ravel(), -k_)[-k_:])
-            vmin = int(mean_bottomk + 1)
-            vmax = int(mean_topk + 1)
-
+            # vmin = int(mean_bottomk + 1)
+            # vmax = int(mean_topk + 1)
+            histSum += 1
+            vmax = np.percentile(histSum, percentile_threshold)
             axes_1[0].imshow(
                 histSum.T,
-                # norm=LogNorm(vmin=1, vmax=histSum.max()),
-                vmin=vmin, vmax=vmax,
+                norm = LogNorm(vmin=1, vmax=max(vmax, 2)),
+                # vmin=vmin, vmax=vmax,
                 cmap=colormap,
                 # cmap=plt.colormaps()[1],
                 aspect="auto",
@@ -539,22 +637,22 @@ def calibration(
             )
 
             axes_1[0].scatter(
-                peak_centers[:, 0], peak_centers[:, 1], marker="+", s=90, c="white", zorder=2
+                peak_centers[:, 0], peak_centers[:, 1], marker="P", s=90, edgecolor = 'black', facecolor = 'white', zorder=2
             )
             axes_1[0].set_ylim(min_y_mask, max_y_mask)
-            axes_1[0].set_xlabel("Pixel")
-            axes_1[0].set_ylabel("Pixel")
-            axes_1[0].set_title("Elastic Lines - Calibration", fontsize=16)
+            axes_1[0].set_xlabel("Pixel", fontsize=12*scale)
+            axes_1[0].set_ylabel("Pixel", fontsize=12*scale)
+            axes_1[0].set_title("Elastic Lines - Calibration", fontsize=16*scale)
 
             axes_1[1].scatter(
-                peak_centers[:, 0], calibrationEnergies, marker="x", facecolor="white", s=60, zorder=3
+                peak_centers[:, 0], calibrationEnergies, marker="x", facecolor=preferred_color, s=60, zorder=3
             )
             axes_1[1].plot(
                 x_line, line(x_line, mCalibration, bCalibration), c="magenta", lw=2, zorder=0
             )
-            axes_1[1].set_title(f"Calibration function", fontsize=16)
-            axes_1[1].set_xlabel("Pixel")
-            axes_1[1].set_ylabel("Energy (eV)")
+            axes_1[1].set_title(f"Calibration function", fontsize=16*scale)
+            axes_1[1].set_xlabel("Pixel", fontsize=12*scale)
+            axes_1[1].set_ylabel("Energy (eV)", fontsize=12*scale)
             axes_1[1].set_xlim(0, x_max + 1)
             axes_1[1].annotate(
                 rf"$E = m \cdot \mathrm{{Pixel}} + b$" + "\n" +
@@ -563,16 +661,22 @@ def calibration(
                 xycoords="axes fraction",
                 ha="left",
                 va="top",
-                fontsize=14,
+                fontsize=14*scale,
             )
 
             fwhm_constant = 2 * np.sqrt(2 * np.log(2))
-            axes_1[2].set_title(f"Resolution", fontsize=16)
+            axes_1[2].set_title(f"Resolution", fontsize=16*scale)
             axes_1[2].scatter(peak_centers[:, 0]*mCalibration + bCalibration,
-                              stdDevs[:, 0]*mCalibration*fwhm_constant, marker="x", facecolor="white", s=60,)
-            axes_1[2].set_xlabel('Energy (eV)')
+                              stdDevs[:, 0]*mCalibration*fwhm_constant, marker="x", facecolor=preferred_color, s=60,)
+            axes_1[2].set_xlabel('Energy (eV)', fontsize=12*scale)
             axes_1[2].set_ylabel(
-                r"$2\sqrt{2\ln(2)}\,\sigma\;\mathrm{(eV)}$", fontsize=12)
+                r"$2\sqrt{2\ln(2)}\,\sigma\;\mathrm{(eV)}$", fontsize=12*scale)
+            
+            for ax in axes_1:
+                ax.tick_params(axis="x", labelsize=x_ticks_size*scale)
+                ax.tick_params(axis="y", labelsize=y_ticks_size * scale)
+                ax.xaxis.label.set_size(axes_label_size * scale) # type: ignore
+                ax.yaxis.label.set_size(axes_label_size * scale) # type: ignore
 
             plt.tight_layout()
             plt.show()
@@ -594,16 +698,21 @@ def calibration(
         successfully_calibrated_datasets += 1
 
         if test_run:
+            plt.rcParams.update({"xtick.labelsize": x_ticks_size})
+            plt.rcParams.update({"ytick.labelsize": y_ticks_size})
+            plt.rcParams.update({"axes.labelsize": axes_label_size})
             break
 
     print(
         f"Successfully completed calibration for {successfully_calibrated_datasets}/{total_data_sets} data set(s)."
     )
+    
 
 
 ####    ####    ####    #####
 
 def process_RIXS(
+    elastic_on_detector = False,
     show_plots=True,
     fig_size=9,
     dark_mode=True,
@@ -613,17 +722,21 @@ def process_RIXS(
     vertical_tolerance=3.5,
     verbose=True,
     analysis_parameters_path: Optional[PathLike] = None,
+    analysis_parameters_dict: Optional[Dict[int, Dict[str, Any]]] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
     calibration_parameters_path: Optional[PathLike] = None,
     test_run=False,
     colormap="gnuplot",
+    percentile_threshold=99.9,
+    sigma_smooth_mask=0.4,
     bin_size_plot=8
 ):
     # Process raw RIXS detector scans into calibrated 1D/2D spectra.
 
     runtime = _build_runtime_context(
         analysis_parameters_path=analysis_parameters_path,
+        analysis_parameters_dict=analysis_parameters_dict,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
         verbose=verbose,
@@ -640,7 +753,11 @@ def process_RIXS(
     bad_pixels = []
     x_max, y_max = 4095, 4095
 
-    data_list = parse_analysis_parameters(runtime.analysis_parameters_path)
+    x_ticks_size = plt.rcParams["xtick.labelsize"]
+    y_ticks_size = plt.rcParams["ytick.labelsize"]
+    axes_label_size = plt.rcParams["axes.labelsize"]
+
+    data_list = runtime.analysis_parameters
     named_datasets = _build_named_datasets(data_list, verbose=verbose)
     total_data_sets = len(named_datasets)
 
@@ -773,12 +890,13 @@ def process_RIXS(
             bins=[x_bins, y_bins])
 
         cleaned, changed_mask, _, total_changed_pixels, iteration = _run_iterative_outlier_removal(
-            histogram=hist_counts,
-            threshold_range=threshold_range,
-            window_mad_filter=window_mad_filter,
-            threshold_max=threshold_max,
-            verbose=verbose,
-        )
+                histogram=hist_counts,
+                elastic_on_detector = elastic_on_detector,
+                threshold_range=threshold_range,
+                window_mad_filter=window_mad_filter,
+                threshold_max=threshold_max,
+                verbose=verbose,
+            )
         histogram_sum = cleaned.copy()
         if verbose:
             print(
@@ -942,7 +1060,11 @@ def process_RIXS(
             ]
             fig_spectra, axs = plt.subplot_mosaic(layout, figsize=(
                 zoom_multiplier*fig_size, zoom_multiplier*fig_size/phi), empty_sentinel=None)  # type:ignore
-            fig_spectra.suptitle(f"{data_name}", fontsize=16)
+            scale = fig_spectra.get_figwidth() / (6*2)
+
+            
+
+            fig_spectra.suptitle(f"{data_name}", fontsize=16*scale)
             axs: Dict[str, Axes] = axs
 
             axs["2"].sharex(axs['1'])
@@ -960,17 +1082,17 @@ def process_RIXS(
             axs["5"].tick_params(labelleft=False)
 
             axs["1"].annotate('Raw Spectrum',          xy=(0.02, 0.94), xycoords="axes fraction",
-                              ha="left", va="top", fontsize=12, color='w',
+                              ha="left", va="top", fontsize=12*scale, color='w',
                               bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.95))
             axs["2"].annotate('Raw Spectrum 1D (Cnt. Norm.)', xy=(0.02, 0.94),
-                              xycoords="axes fraction", ha="left", va="top", fontsize=12)
-            axs["3"].annotate('Cleaned Spectrum', xy=(0.02, 0.94), xycoords="axes fraction",
-                              ha="left", va="top", fontsize=12, color='w',
+                              xycoords="axes fraction", ha="left", va="top", fontsize=12*scale)
+            axs["3"].annotate('Denoised Spectrum', xy=(0.02, 0.94), xycoords="axes fraction",
+                              ha="left", va="top", fontsize=12*scale, color='w',
                               bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.95))
-            axs["4"].annotate('Cleaned Spectrum 1D (Cnt. Norm.)',   xy=(
-                0.02, 0.94), xycoords="axes fraction", ha="left", va="top", fontsize=12)
+            axs["4"].annotate('Denoised Spectrum 1D (Cnt. Norm.)',   xy=(
+                0.02, 0.94), xycoords="axes fraction", ha="left", va="top", fontsize=12*scale)
             axs["5"].annotate('Changed Pixels',        xy=(0.02, 0.94), xycoords="axes fraction",
-                              ha="left", va="top", fontsize=12, color='w',
+                              ha="left", va="top", fontsize=12*scale, color='w',
                               bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.95))
 
             k_ = min(100, hist_total.size)
@@ -978,10 +1100,12 @@ def process_RIXS(
                 hist_total.ravel(), k_ - 1)[:k_])
             mean_topk = np.mean(np.partition(hist_total.ravel(), -k_)[-k_:])
             vmin = int(mean_bottomk + 1)
-            vmax = int(mean_topk + 1)
-
+            # vmax = int(mean_topk + 1)
+            hist_counts += 1
+            vmax = np.percentile(hist_counts, percentile_threshold)
+            
             axs["1"].imshow(hist_counts[:, y_min_hist:y_max_hist].T, origin='lower', aspect='auto',
-                            vmin=vmin, vmax=vmax, cmap=colormap)
+                            norm = LogNorm(vmin=1, vmax=max(vmax, 2)), cmap=colormap)
             axs["1"].set_ylabel("Pixel")
             axs["1"].grid(color="black", alpha=1)
             axs["2"].plot(np.arange(hist_counts.shape[0]), np.sum(
@@ -994,32 +1118,41 @@ def process_RIXS(
             axs["2"].set_ylabel("Counts")
             axs["2"].set_xlim(0, x_max)
             axs["2"].set_yticklabels([])
-            axs["2"].legend(loc="upper right", fontsize=12)
+            axs["2"].legend(loc="upper right", fontsize=12*scale)
 
+            hist_total += 1
+            vmax = np.percentile(hist_total, percentile_threshold)
             axs["3"].imshow(hist_total[:, y_min_hist:y_max_hist].T, origin='lower', aspect='auto',
-                            vmin=vmin, vmax=vmax, cmap=colormap)
+                            norm = LogNorm(vmin=1, vmax=max(vmax, 2)), cmap=colormap)
 
             # axs["3"].axhline(y_min_hist, color='white', linestyle='-')
             # axs["3"].axhline(y_max_hist, color='white', linestyle='-')
             # axs["5"].axhline(y_min_hist, color='white', linestyle='-')
             # axs["5"].axhline(y_max_hist, color='white', linestyle='-')
             axs["4"].plot(np.arange(hist_total_2.shape[0]), np.sum(
-                hist_total_2, axis=1)*bin_size_plot, c='darkviolet')
+                hist_total_2, axis=1)*bin_size_plot, c='darkviolet', label=f'Denoised')
             x_bin, y_bin, _ = binned_spectrum(np.arange(hist_total_2.shape[0]),
                                               np.sum(hist_total_2, axis=1), bin_size=bin_size_plot)
-            vmin_clean = 0.25*np.percentile(y_bin, 1)
+            vmin_clean = 0.25*np.percentile(y_bin, .1)
             vmax_clean = 1.15*np.percentile(y_bin, 99.9)
             axs["4"].plot(x_bin, y_bin, c='black',
                           label=f'Binned (bin size={bin_size_plot})')
-            axs["4"].set_ylim(vmin_clean, vmax_clean)
+            axs["4"].set_ylim(top =  vmax_clean)
             axs["4"].set_xlabel("Pixel")
-            axs["4"].legend(loc="upper right", fontsize=12)
-            vmin_raw = 0.25*np.percentile(np.sum(hist_counts, axis=1), 1)
+            axs["4"].legend(loc="upper right", fontsize=12*scale)
+            vmin_raw = 0.25*np.percentile(np.sum(hist_counts, axis=1), .1)
             vmax_raw = 1.15*np.percentile(np.sum(hist_counts, axis=1), 99)
-            axs["2"].set_ylim(vmin_raw, vmax_raw)
-            axs["5"].imshow(changed_mask[:, y_min_hist:y_max_hist].T, origin='lower',
-                            aspect='auto', cmap=colormap)
-
+            axs["2"].set_ylim(top =  vmax_raw)
+            
+            # axs["5"].imshow(changed_mask[:, y_min_hist:y_max_hist].T, origin='lower',
+            #                 vmin = 0, vmax = 1, aspect='auto', cmap=colormap_mask)
+            smooth = gaussian_filter(changed_mask[:, y_min_hist:y_max_hist].astype(float), sigma=sigma_smooth_mask)
+            axs["5"].imshow(smooth.T > .01, cmap="binary_r", origin='lower', aspect='auto')
+            for ax in axs.values():
+                ax.tick_params(axis="x", labelsize=x_ticks_size*scale)
+                ax.tick_params(axis="y", labelsize=y_ticks_size * scale)
+                ax.xaxis.label.set_size(axes_label_size * scale) # type: ignore
+                ax.yaxis.label.set_size(axes_label_size * scale) # type: ignore
             plt.tight_layout()
             plt.show()
         successfully_processed_datasets += 1
@@ -1030,6 +1163,8 @@ def process_RIXS(
     print(
         f"Successfully processed {successfully_processed_datasets}/{total_data_sets} data set(s)."
     )
+
+    
     return processed_data
 
 
@@ -1043,22 +1178,31 @@ def symmetrize_spectrum(
     figures_output_dir: Optional[PathLike] = None,
     calibration_parameters_path: Optional[PathLike] = None,
     analysis_parameters_path: Optional[PathLike] = None,
+    analysis_parameters_dict: Optional[Dict[int, Dict[str, Any]]] = None,
     scans_path: Optional[PathLike] = None,
     spec_files_path: Optional[PathLike] = None,
+    colormap="gnuplot",
+    percentile_threshold=99.9,
 ):
     # Fill cropped detector regions by mirror symmetrization around the elastic line.
 
     _build_runtime_context(
         analysis_parameters_path=analysis_parameters_path,
+        analysis_parameters_dict=analysis_parameters_dict,
         scans_path=scans_path,
         spec_files_path=spec_files_path,
         verbose=verbose,
+        require_analysis_parameters=False,
     )
 
     if dark_mode:
         apply_custom_plot_style()
     else:
         apply_custom_plot_style_light()
+
+    x_ticks_size = plt.rcParams["xtick.labelsize"]
+    y_ticks_size = plt.rcParams["ytick.labelsize"]
+    axes_label_size = plt.rcParams["axes.labelsize"]
 
     calibration_parameters_dir = _resolve_optional_path(
         calibration_parameters_path, cwd
@@ -1180,15 +1324,21 @@ def symmetrize_spectrum(
 
             fig_single, ax0 = plt.subplots(
                 figsize=(fig_size, fig_size/phi), nrows=2, ncols=1, gridspec_kw={'height_ratios': [1, 1]})
-
+            scale = fig_single.get_figwidth() / (6*2)
+            
             # Raw spectrum
+            hist_total_work += 1
+            vmax = np.percentile(cleaned_symmetrized, percentile_threshold)
+
             ax0[0].imshow(hist_total_work[:, :].T, origin='lower', aspect='auto',
-                          vmin=vmin, vmax=vmax, cmap="hot")
+                          norm = LogNorm(vmin=1, vmax=max(vmax, 2)), cmap= colormap)
             ax0[0].set_ylabel('Pixel')
             ax0[0].set_title('Pre Symmetrization Spectrum')
             # Symmetrized spectrum with reference lines
+            cleaned_symmetrized += 1
+            vmax = np.percentile(cleaned_symmetrized, percentile_threshold)
             ax0[1].imshow(cleaned_symmetrized[:, :].T, origin='lower', aspect='auto',
-                          vmin=vmin, vmax=vmax, cmap="hot")
+                          norm = LogNorm(vmin=1, vmax=max(vmax, 2)), cmap= colormap)
             ax0[1].axhline(center_fit, color='black', linestyle='-',
                            linewidth=2, label='Center')
             ax0[1].axhline(center_fit, color='white', linestyle=':',
@@ -1218,13 +1368,19 @@ def symmetrize_spectrum(
                             color='magenta', linewidth=2, label='Mirror top')
             ax0[0].set_ylim(0, hist_total_work.shape[1])
             ax0[1].set_ylim(0, hist_total_work.shape[1])
-            # ax0[1].legend(loc='upper left', fontsize=10,  framealpha=0.8, labelcolor='black',
+            # ax0[1].legend(loc='upper left', fontsize=10*scale,  framealpha=0.8, labelcolor='black',
             #                edgecolor='black', facecolor='white')
             ax0[1].set_ylabel('Pixel')
             ax0[1].set_title('Symmetrized Spectrum')
 
+            for ax in ax0:
+                ax.tick_params(axis="x", labelsize=x_ticks_size*scale)
+                ax.tick_params(axis="y", labelsize=y_ticks_size * scale)
+                ax.xaxis.label.set_size(axes_label_size * scale) # type: ignore
+                ax.yaxis.label.set_size(axes_label_size * scale) # type: ignore
+
             fig_single.suptitle(
-                f"Symmetrize {data_name}", fontsize=14)
+                f"Symmetrize {data_name}", fontsize=14*scale)
             plt.tight_layout()
             plt.show()
 
@@ -1238,6 +1394,7 @@ def symmetrize_spectrum(
     print(
         f"Successfully symmetrized {successfully_symmetrized_datasets}/{total_data_sets} data set(s)."
     )
+
     return processed_data
 
 
@@ -1266,7 +1423,11 @@ def export_1D_spectra(
             )
 
     per_sample_spectra = {}
+    loss_scale_flags = {}  # Track Loss_Scale status for each sample
+    
     for sample_name, keys in processed_data.items():
+        loss_scale_flags[sample_name] = keys['Loss_Scale']
+        
         if 'symmetrized_histogram' in keys:
             export_histogram = keys['symmetrized_histogram']
         else:
@@ -1284,7 +1445,8 @@ def export_1D_spectra(
 
     if not merge:
         for sample_name, export_array in per_sample_spectra.items():
-            _save_spectrum(sample_name, export_array)
+            final_name = sample_name + "_loss" if loss_scale_flags[sample_name] else sample_name
+            _save_spectrum(final_name, export_array)
 
         return
 
@@ -1304,11 +1466,73 @@ def export_1D_spectra(
         if len(members) > 1:
             spectra_to_sum = [per_sample_spectra[name] for name in members]
             export_array = sum_spectra(spectra_to_sum)
-            _save_spectrum(base_name, export_array)
+            # For merged spectra, add "_loss" if any member has Loss_Scale=True
+            has_loss = any(loss_scale_flags[name] for name in members)
+            final_name = base_name + "_loss" if has_loss else base_name
+            _save_spectrum(final_name, export_array)
             print(
                 f"Merged {', '.join(members)} into {base_name}.\n"
             )
         else:
             sample_name = members[0]
             export_array = per_sample_spectra[sample_name]
-            _save_spectrum(sample_name, export_array)
+            final_name = sample_name + "_loss" if loss_scale_flags[sample_name] else sample_name
+            _save_spectrum(final_name, export_array)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

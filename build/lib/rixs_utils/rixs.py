@@ -25,6 +25,9 @@ import math
 from dataclasses import dataclass
 phi = (1 + math.sqrt(5)) / 2
 
+
+print("Test")
+
 num_cpus = os.cpu_count()
 set_num_threads(num_cpus - 2)  # type: ignore
 
@@ -1409,6 +1412,7 @@ def calibration_graze(
     calib_scan_nums,
     scan_ranges,
     spec_dir="../SpecData",
+    bottom_bound = 0,
     output_dir=None,
     show_plots=True,
     save_images=False,
@@ -1473,6 +1477,11 @@ def calibration_graze(
 
         x = eventXY[:, 0]
         y = eventXY[:, 1]
+        # Filter: only keep events with y > bottom_bound (x and y stay in sync)
+        mask_bottom_bound = y > bottom_bound
+        eventXY = eventXY[mask_bottom_bound]
+        x = x[mask_bottom_bound]
+        y = y[mask_bottom_bound]
 
         hist2d, _, _ = np.histogram2d(x, y, bins=(x_bins, y_bins))
         histogram_all_raw += hist2d
@@ -1527,6 +1536,12 @@ def calibration_graze(
 
         x = eventXY[:, 0]
         y = eventXY[:, 1]
+
+        mask_bottom_bound = y > bottom_bound
+        eventXY = eventXY[mask_bottom_bound]
+        x = x[mask_bottom_bound]
+        y = y[mask_bottom_bound]
+
         x, y = rotate_events_xy(x, y, -angle, xc=900.0, yc=900.0)
 
         hist2d, _, _ = np.histogram2d(x, y, bins=(x_bins, y_bins))
@@ -1638,6 +1653,11 @@ def calibration_graze(
     for file_num, eventXY in enumerate(calibration_files):
         x = eventXY[:, 0]
         y = eventXY[:, 1]
+
+        mask_bottom_bound = y > bottom_bound
+        eventXY = eventXY[mask_bottom_bound]
+        x = x[mask_bottom_bound]
+        y = y[mask_bottom_bound]
 
         x, y = rotate_events_xy(x, y, -angle, xc=900.0, yc=900.0)
 
@@ -2107,6 +2127,7 @@ def process_RIXS_graze(
     calibration,
     scan_ranges=None,
     show_plots=True,
+    bottom_bound=0,
     dark_mode=None,
     save_images=False,
     save_txt=True,
@@ -2191,6 +2212,10 @@ def process_RIXS_graze(
         for _, path_x, path_y in scan_files:
             eventXY = read_scan_xy(path_x, path_y)
             x, y = eventXY[:, 0], eventXY[:, 1]
+            mask_bottom_bound = y > bottom_bound
+            eventXY = eventXY[mask_bottom_bound]
+            x = x[mask_bottom_bound]
+            y = y[mask_bottom_bound]
             x, y = rotate_events_xy(x, y, -angle, xc=900.0, yc=900.0)
 
             hist2d, _, _ = np.histogram2d(
